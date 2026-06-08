@@ -1,0 +1,15 @@
+[project]
+name = "llm-deepseek-v4"
+version = "0.1.0"
+description = "LLM plugin to access DeepSeek's V4 models"
+authors = [{ name = "Ziqin Wang" }]
+requires-python = ">=3.12"
+license = "MIT"
+dependencies = [
+    "httpx>=0.28.1",
+    "llm>=0.32a2",
+    "openai>=2.32.0",
+]
+
+[project.entry-points.llm]
+deepseek = "llm_deepseek"
