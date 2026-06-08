@@ -3,7 +3,7 @@ from typing import Iterable, Iterator, Literal, override, cast
 import httpx
 import llm
 from llm.parts import StreamEvent, TextPart
-from llm.utils import remove_dict_none_values
+from llm.utils import remove_dict_none_values, simplify_usage_dict
 from openai import OpenAI
 from openai.types.chat import ChatCompletionMessageParam
 
@@ -49,6 +49,7 @@ class DeepSeekModel(llm.KeyModel):
                 'user_id': options.user_id,
             },
         })
+        usage = None
         if stream:
             completion = client.chat.completions.create(
                 model=self.model_id,
@@ -65,6 +66,8 @@ class DeepSeekModel(llm.KeyModel):
                         yield StreamEvent(type='reasoning', chunk=delta_reasoning_content)
                     if delta.content:
                         yield StreamEvent(type='text', chunk=delta.content)
+                if chunk.usage:
+                    usage = chunk.usage
         else:
             completion = client.chat.completions.create(
                 model=self.model_id,
@@ -79,7 +82,13 @@ class DeepSeekModel(llm.KeyModel):
                     yield StreamEvent(type='reasoning', chunk=reasoning_content)
                 if message.content:
                     yield StreamEvent(type='text', chunk=message.content)
-        # TODO: record usage
+            if completion.usage:
+                usage = completion.usage
+        if usage:
+            response.set_usage(input=usage.prompt_tokens, output=usage.completion_tokens, details=simplify_usage_dict({
+                'cached_tokens': usage.prompt_tokens_details.cached_tokens if usage.prompt_tokens_details else None,
+                'reasoning_tokens': usage.completion_tokens_details.reasoning_tokens if usage.completion_tokens_details else None,
+            }))
 
     def build_messages(self, prompt: llm.Prompt, conversation: llm.Conversation | None) -> Iterable[ChatCompletionMessageParam]:
         messages = []
