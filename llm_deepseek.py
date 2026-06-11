@@ -18,7 +18,7 @@ class DeepSeekModel(llm.KeyModel):
     needs_key = 'deepseek'
     key_env_var = 'DEEPSEEK_API_KEY'
     can_stream = True
-    supports_schema = False # TODO
+    supports_schema = False
     supports_tools = True
 
     class Options(llm.KeyModel.Options):
@@ -28,6 +28,7 @@ class DeepSeekModel(llm.KeyModel):
         temperature: float | None = None  # [0, 2], default to 1
         top_p: float | None = None  # [0, 1], default to 1
         user_id: str | None = None
+        json_output: bool = False
 
     @override
     def __init__(self, model_id: str):
@@ -48,6 +49,7 @@ class DeepSeekModel(llm.KeyModel):
             'temperature': options.temperature if not thinking_mode else None,
             'top_p': options.top_p if not thinking_mode else None,
             'tools': self._build_tools(prompt.tools) if prompt.tools else None,
+            'response_format': {'type': 'json_object' if options.json_output else 'text'},
             'extra_body': {
                 'thinking': {'type': 'enabled' if thinking_mode else 'disabled'},
                 'user_id': options.user_id,
