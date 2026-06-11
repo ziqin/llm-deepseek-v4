@@ -1,11 +1,14 @@
+import json
 from typing import Iterable, Iterator, Literal, override, cast
 
 import httpx
 import llm
-from llm.parts import StreamEvent, TextPart
+from llm.parts import ReasoningPart, StreamEvent, TextPart, ToolCallPart, ToolResultPart
 from llm.utils import remove_dict_none_values, simplify_usage_dict
 from openai import OpenAI
-from openai.types.chat import ChatCompletionMessageParam
+from openai.types.chat import ChatCompletionAssistantMessageParam, ChatCompletionFunctionToolParam, ChatCompletionMessageFunctionToolCallParam, ChatCompletionMessageParam, ChatCompletionMessageToolCall
+from openai.types.chat.chat_completion_chunk import ChoiceDeltaToolCall
+from openai.types.shared_params import FunctionDefinition
 
 
 API_BASE_URL = 'https://api.deepseek.com'
@@ -16,7 +19,7 @@ class DeepSeekModel(llm.KeyModel):
     key_env_var = 'DEEPSEEK_API_KEY'
     can_stream = True
     supports_schema = False # TODO
-    supports_tools = False # TODO
+    supports_tools = True
 
     class Options(llm.KeyModel.Options):
         reasoning_effort: Literal['high', 'max'] | None = None
@@ -44,6 +47,7 @@ class DeepSeekModel(llm.KeyModel):
             'stop': options.stop,
             'temperature': options.temperature if not thinking_mode else None,
             'top_p': options.top_p if not thinking_mode else None,
+            'tools': self._build_tools(prompt.tools) if prompt.tools else None,
             'extra_body': {
                 'thinking': {'type': 'enabled' if thinking_mode else 'disabled'},
                 'user_id': options.user_id,
@@ -58,16 +62,38 @@ class DeepSeekModel(llm.KeyModel):
                 stream_options={'include_usage': True},
                 **kwargs,
             )
+            tool_calls: dict[int, ChoiceDeltaToolCall] = {}
             for chunk in completion:
-                for choice in chunk.choices:
-                    delta = choice.delta
+                if chunk.choices:
+                    delta = chunk.choices[0].delta
                     delta_reasoning_content = getattr(delta, 'reasoning_content', None)
                     if delta_reasoning_content:
                         yield StreamEvent(type='reasoning', chunk=delta_reasoning_content)
+                    for tool_call in delta.tool_calls or []:
+                        if tool_call.function is None:
+                            continue
+                        if tool_call.function.arguments is None:
+                            tool_call.function.arguments = ''
+                        idx = tool_call.index
+                        if idx not in tool_calls:
+                            tool_calls[idx] = tool_call
+                            yield StreamEvent(type='tool_call_name', chunk=tool_call.function.name or '', tool_call_id=tool_call.id)
+                        else:
+                            tool_calls[idx].function.arguments += tool_call.function.arguments  # type: ignore[union-attr]
+                        if tool_call.function.arguments:
+                            yield StreamEvent(type='tool_call_args', chunk=tool_call.function.arguments, tool_call_id=tool_calls[idx].id)
                     if delta.content:
                         yield StreamEvent(type='text', chunk=delta.content)
                 if chunk.usage:
                     usage = chunk.usage
+            for tool_call in tool_calls.values():
+                if tool_call.function is None:
+                    continue
+                response.add_tool_call(llm.ToolCall(
+                    tool_call_id=tool_call.id,
+                    name=cast(str, tool_call.function.name),
+                    arguments=json.loads(cast(str, tool_call.function.arguments)),
+                ))
         else:
             completion = client.chat.completions.create(
                 model=self.model_id,
@@ -75,11 +101,21 @@ class DeepSeekModel(llm.KeyModel):
                 stream=False,
                 **kwargs,
             )
-            for choice in completion.choices:
+            if completion.choices:
+                choice = completion.choices[0]
                 message = choice.message
                 reasoning_content = getattr(message, 'reasoning_content', None)
                 if reasoning_content:
                     yield StreamEvent(type='reasoning', chunk=reasoning_content)
+                for tool_call in message.tool_calls or []:
+                    if isinstance(tool_call, ChatCompletionMessageToolCall):
+                        yield StreamEvent(type='tool_call_name', chunk=tool_call.function.name, tool_call_id=tool_call.id)
+                        yield StreamEvent(type='tool_call_args', chunk=tool_call.function.arguments, tool_call_id=tool_call.id)
+                        response.add_tool_call(llm.ToolCall(
+                            tool_call_id=tool_call.id,
+                            name=tool_call.function.name,
+                            arguments=json.loads(tool_call.function.arguments),
+                        ))
                 if message.content:
                     yield StreamEvent(type='text', chunk=message.content)
             if completion.usage:
@@ -90,17 +126,50 @@ class DeepSeekModel(llm.KeyModel):
                 'reasoning_tokens': usage.completion_tokens_details.reasoning_tokens if usage.completion_tokens_details else None,
             }))
 
-    def build_messages(self, prompt: llm.Prompt, conversation: llm.Conversation | None) -> Iterable[ChatCompletionMessageParam]:
-        messages = []
+    @staticmethod
+    def _build_tools(tools: list[llm.Tool]) -> Iterable[ChatCompletionFunctionToolParam]:
+        for tool in tools:
+            definition: FunctionDefinition = {'name': tool.name, 'parameters': tool.input_schema}
+            if tool.description is not None:
+                definition['description'] = tool.description
+            yield {'type': 'function', 'function': definition}
+
+    @staticmethod
+    def build_messages(prompt: llm.Prompt, conversation: llm.Conversation | None) -> Iterable[ChatCompletionMessageParam]:
         for message in prompt.messages:
-            texts = []
-            for part in message.parts:
-                if isinstance(part, TextPart):
-                    texts.append(part.text)
-            if not texts and message.role in ('user', 'system'):
-                continue
-            messages.append({'role': message.role, 'content': ''.join(texts)})
-        return messages
+            if message.role == 'system':
+                content = ''.join(part.text for part in message.parts if isinstance(part, TextPart))
+                if content:
+                    yield {'role': 'system', 'content': content}
+            elif message.role == 'user':
+                content = ''.join(part.text for part in message.parts if isinstance(part, TextPart))
+                if content:
+                    yield {'role': 'user', 'content': content}
+            elif message.role == 'assistant':
+                content = ''.join(part.text for part in message.parts if isinstance(part, TextPart))
+                reasoning = ''.join(part.text for part in message.parts if isinstance(part, ReasoningPart))
+                tool_calls: list[ChatCompletionMessageFunctionToolCallParam] = [
+                    {
+                        'type': 'function',
+                        'id': cast(str, part.tool_call_id),
+                        'function': {'name': part.name, 'arguments': json.dumps(part.arguments)},
+                    }
+                    for part in message.parts if isinstance(part, ToolCallPart)
+                ]
+                assistant_message: ChatCompletionAssistantMessageParam = {'role': 'assistant', 'content': content or None}
+                if reasoning:
+                    assistant_message['reasoning_content'] = reasoning  # type: ignore[typeddict-unknown-key]
+                if tool_calls:
+                    assistant_message['tool_calls'] = tool_calls
+                yield assistant_message
+            elif message.role == 'tool':
+                for part in message.parts:
+                    if isinstance(part, ToolResultPart):
+                        yield {
+                            'role': 'tool',
+                            'tool_call_id': cast(str, part.tool_call_id),
+                            'content': part.output,
+                        }
 
 
 @llm.hookimpl
